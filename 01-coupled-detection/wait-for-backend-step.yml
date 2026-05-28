@@ -1,0 +1,36 @@
+# Goes inside deploy-frontend.yml, as the first step of the
+# build-and-deploy job, BEFORE pnpm install or any build work.
+#
+# At this stage the gate only detects whether the backend was touched
+# — it doesn't poll yet. The next stage adds the actual wait.
+
+permissions:
+  contents: read
+  # Required for the next stage (poll-by-sha) to query workflow runs.
+  # Declared here so adding the next stage is a one-line change.
+  actions: read
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # fetch-depth: 1 (the default) means `git diff HEAD~1 HEAD`
+          # returns nothing — the script reads "no backend changes" and
+          # silently proceeds. Bump to 2 so the parent commit exists.
+          fetch-depth: 2
+
+      - name: Detect coupled push
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          # The pattern must mirror deploy-backend.yml's `paths:` block
+          # exactly — drift here is the #1 source of false proceeds.
+          if ! echo "$changed" | grep -qE "^(backend/|infra/|\.github/workflows/deploy-backend\.yml$)"; then
+            echo "No backend/infra changes — proceeding."
+            exit 0
+          fi
+          echo "Backend changes detected — gate engaged (no wait yet)."
+
+      # ... rest of the deploy steps (build, sync, invalidate)

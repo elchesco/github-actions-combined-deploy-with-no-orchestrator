@@ -1,0 +1,101 @@
+# Final form. Adds:
+#   - fetch_runs() wrapper that surfaces the HTTP status on failure
+#     (curl -f exits 22 with no body — useless when debugging a 403
+#     because actions: read was dropped)
+#   - explicit conclusion print on backend failure so the dev sees
+#     `failure | cancelled | timed_out` in the log
+#
+# Drop this whole step into the top of your build-and-deploy job in
+# deploy-frontend.yml. Make sure the permissions block matches.
+
+permissions:
+  contents: read
+  actions: read  # required for the workflow-runs API call
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+      contents: read
+      # Job-level permissions OVERRIDE the workflow-level block (they
+      # don't merge), so re-declare actions: read here too.
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # At least 2 commits — git diff HEAD~1 HEAD needs the parent.
+          fetch-depth: 2
+
+      - name: Wait for backend deploy on same commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          if ! echo "$changed" | grep -qE "^(backend/|infra/|\.github/workflows/deploy-backend\.yml$)"; then
+            echo "No backend/infra changes in this commit — proceeding."
+            exit 0
+          fi
+          echo "Backend changes detected — waiting for deploy-backend.yml on ${GITHUB_SHA}."
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-backend.yml/runs"
+          query="head_sha=${GITHUB_SHA}&per_page=1"
+
+          # --write-out separates body from status so we can surface
+          # a meaningful error on 4xx (e.g. 403 = actions: read was
+          # dropped from the workflow). curl -f would just exit 22
+          # with no body, which is impossible to debug from the log.
+          fetch_runs() {
+            local response status body
+            response=$(
+              curl -sS \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -w "\n%{http_code}" \
+                "${api}?${query}"
+            )
+            status=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            if [ "$status" != "200" ]; then
+              echo "::error::GitHub API returned ${status}: ${body}" >&2
+              return 1
+            fi
+            echo "$body"
+          }
+
+          # Grace window — 30s for GitHub to register the run.
+          for i in $(seq 1 6); do
+            run_count=$(fetch_runs | jq -r '.total_count')
+            if [ "$run_count" != "0" ]; then break; fi
+            echo "Backend run not registered yet (${i}/6) — sleeping 5s."
+            sleep 5
+          done
+
+          # Main poll — 160 × 15s = 40 min ceiling.
+          for i in $(seq 1 160); do
+            payload=$(fetch_runs)
+            status=$(echo "$payload" | jq -r '.workflow_runs[0].status // empty')
+            conclusion=$(echo "$payload" | jq -r '.workflow_runs[0].conclusion // empty')
+            if [ -z "$status" ]; then
+              echo "No backend run on this SHA — proceeding."
+              exit 0
+            fi
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|skipped)
+                  echo "Backend deploy ${conclusion} — proceeding with frontend deploy."
+                  exit 0
+                  ;;
+                *)
+                  echo "::error::Backend deploy ${conclusion}. Aborting frontend deploy so the SPA never points at a missing API."
+                  exit 1
+                  ;;
+              esac
+            fi
+            echo "Backend deploy ${status} (poll ${i}/160) — sleeping 15s."
+            sleep 15
+          done
+          echo "::error::Timed out waiting for backend deploy."
+          exit 1

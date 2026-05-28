@@ -1,0 +1,81 @@
+# Adds the 30s grace window so the gate doesn't false-proceed when
+# GitHub hasn't registered the backend workflow run on the SHA yet.
+#
+# Measured registration delay: usually < 10s, spiked to 18s once
+# during a GitHub incident. 30s is conservative; the 40-minute outer
+# timeout absorbs the extra runner seconds.
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Wait for backend deploy on same commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          if ! echo "$changed" | grep -qE "^(backend/|infra/|\.github/workflows/deploy-backend\.yml$)"; then
+            echo "No backend/infra changes — proceeding."
+            exit 0
+          fi
+          echo "Backend changes detected — waiting on deploy-backend.yml for ${GITHUB_SHA}."
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-backend.yml/runs"
+          query="head_sha=${GITHUB_SHA}&per_page=1"
+
+          fetch_runs() {
+            curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${api}?${query}"
+          }
+
+          # ── Grace window ────────────────────────────────────────────
+          # Give GitHub up to 30s to register the backend workflow run
+          # on this SHA. Without this the script would read total_count=0
+          # and false-proceed.
+          for i in $(seq 1 6); do
+            count=$(fetch_runs | jq -r '.total_count')
+            if [ "$count" != "0" ]; then break; fi
+            echo "Backend run not registered yet (${i}/6) — sleeping 5s."
+            sleep 5
+          done
+
+          # Main poll loop — same as stage 02.
+          for i in $(seq 1 160); do
+            payload=$(fetch_runs)
+            status=$(echo "$payload" | jq -r '.workflow_runs[0].status // empty')
+            conclusion=$(echo "$payload" | jq -r '.workflow_runs[0].conclusion // empty')
+            if [ -z "$status" ]; then
+              # Still no run after grace window — backend workflow
+              # genuinely wasn't triggered (paths filter excluded the
+              # changes) or GitHub is so broken that a frontend deploy
+              # is the least of our problems.
+              echo "No backend run on this SHA after grace window — proceeding."
+              exit 0
+            fi
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|skipped) echo "Backend deploy ${conclusion} — proceeding."; exit 0 ;;
+                *) echo "::error::Backend deploy ${conclusion}."; exit 1 ;;
+              esac
+            fi
+            echo "Backend deploy ${status} (poll ${i}/160) — sleeping 15s."
+            sleep 15
+          done
+          echo "::error::Timed out waiting for backend deploy."
+          exit 1
